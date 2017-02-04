@@ -24,6 +24,6 @@ script:
   - touch doc/stamp_mans
   - make ABI_SKIP=1 dist
 
-after_script:
-  - cppcheck --force -q -Iinclude lib src
-  - sudo killall freeradius
+#after_script:
+#  - cppcheck --force -q -Iinclude lib src
+#  - sudo killall freeradius
