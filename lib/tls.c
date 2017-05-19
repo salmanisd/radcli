@@ -26,10 +26,14 @@
 #include <config.h>
 #include <includes.h>
 #include <radcli/radcli.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/crypto.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
 #include "util.h"
 #include "tls.h"
-
-#ifdef HAVE_GNUTLS
 
 /**
  * @defgroup tls-api TLS/DTLS API
@@ -44,8 +48,6 @@
  * @{
  */
 
-#include <gnutls/gnutls.h>
-#include <gnutls/dtls.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -56,7 +58,7 @@ typedef struct tls_int_st {
 	char hostname[256];	/* server's hostname */
 	unsigned port;		/* server's port */
 	struct sockaddr_storage our_sockaddr;
-	gnutls_session_t session;
+	SSL *ssl;
 	int sockfd;
 	unsigned init;
 	unsigned need_restart;
@@ -67,8 +69,6 @@ typedef struct tls_int_st {
 } tls_int_st;
 
 typedef struct tls_st {
-	gnutls_psk_client_credentials_t psk_cred;
-	gnutls_certificate_credentials_t x509_cred;
 	struct tls_int_st ctx;	/* one for ACCT and another for AUTH */
 	unsigned flags; /* the flags set on init */
 	rc_handle *rh; /* a pointer to our owner */
@@ -88,24 +88,25 @@ static ssize_t tls_sendto(void *ptr, int sockfd,
 			   socklen_t addrlen)
 {
 	tls_st *st = ptr;
-	int ret;
+	int ret = 0 , bs = 0;
+	size_t bytes_sent = 0;
 
 	if (st->ctx.need_restart != 0) {
 		restart_session(st->rh, st);
 	}
 
-	ret = gnutls_record_send(st->ctx.session, buf, len);
-	if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED) {
-		errno = EINTR;
-		return -1;
-	}
-
-	if (ret < 0) {
-		rc_log(LOG_ERR, "%s: error in sending: %s", __func__,
-		       gnutls_strerror(ret));
-		errno = EIO;
-		st->ctx.need_restart = 1;
-		return -1;
+	while (bytes_sent < len) {
+		bs = SSL_write(st->ctx.ssl, buf+bytes_sent, len-bytes_sent);
+		if (bs < 1) {
+			rc_log(LOG_ERR, "%s: SSL write failed with error  %d", __func__, SSL_get_error(st->ctx.ssl, bs));
+			errno = EIO;
+			st->ctx.need_restart = 1;
+			return -1;
+		}
+		if (bs == 0) {
+			return -1;
+		}
+		bytes_sent += bs;
 	}
 
 	st->ctx.last_msg = time(0);
@@ -132,86 +133,18 @@ static ssize_t tls_recvfrom(void *ptr, int sockfd,
 			     socklen_t * addrlen)
 {
 	tls_st *st = ptr;
-	int ret;
+	int ret =0, br = 0;
 
-	ret = gnutls_record_recv(st->ctx.session, buf, len);
-	if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED ||
-	    ret == GNUTLS_E_HEARTBEAT_PING_RECEIVED || ret == GNUTLS_E_HEARTBEAT_PONG_RECEIVED) {
-		errno = EINTR;
-		return -1;
-	}
-
-	if (ret == GNUTLS_E_WARNING_ALERT_RECEIVED) {
-		rc_log(LOG_ERR, "%s: received alert: %s", __func__,
-		       gnutls_alert_get_name(gnutls_alert_get(st->ctx.session)));
-		errno = EINTR;
-		return -1;
-	}
-
-	/* RFC6614 says: "After the TLS session is established, RADIUS packet payloads are
-	 * exchanged over the encrypted TLS tunnel.  In RADIUS/UDP, the
-	 * packet size can be determined by evaluating the size of the
-	 * datagram that arrived.  Due to the stream nature of TCP and TLS,
-	 * this does not hold true for RADIUS/TLS packet exchange.",
-	 *
-	 * That is correct in principle but it fails to associate the length with 
-	 * the TLS record boundaries. Here, when in TLS, we assume that a single TLS
-	 * record holds a single radius packet. It wouldn't make sense anyway to send
-	 * multiple TLS records for a single packet.
-	 */
-
-	if (ret <= 0) {
-		rc_log(LOG_ERR, "%s: error in receiving: %s", __func__,
-		       gnutls_strerror(ret));
+	br = SSL_read(st->ctx.ssl, buf, len);
+	if (br <= 0) {
+		rc_log(LOG_ERR, "%s: SSL read failed", __func__);
 		errno = EIO;
 		st->ctx.need_restart = 1;
 		return -1;
 	}
 
 	st->ctx.last_msg = time(0);
-	return ret;
-}
-
-/* This function will verify the peer's certificate, and check
- * if the hostname matches.
- */
-static int cert_verify_callback(gnutls_session_t session)
-{
-	unsigned int status;
-	int ret;
-	struct tls_int_st *ctx;
-	gnutls_datum_t out;
-
-	/* read hostname */
-	ctx = gnutls_session_get_ptr(session);
-	if (ctx == NULL)
-		return GNUTLS_E_CERTIFICATE_ERROR;
-
-	if (ctx->skip_hostname_check)
-		ret = gnutls_certificate_verify_peers2(session, &status);
-	else
-		ret = gnutls_certificate_verify_peers3(session, ctx->hostname, &status);
-	if (ret < 0) {
-		rc_log(LOG_ERR, "%s: error in certificate verification: %s",
-		       __func__, gnutls_strerror(ret));
-		return GNUTLS_E_CERTIFICATE_ERROR;
-	}
-
-	if (status != 0) {
-		ret =
-		    gnutls_certificate_verification_status_print(status,
-								 gnutls_certificate_type_get
-								 (session),
-								 &out, 0);
-		if (ret < 0) {
-			return GNUTLS_E_CERTIFICATE_ERROR;
-		}
-		rc_log(LOG_INFO, "%s: certificate: %s", __func__, out.data);
-		gnutls_free(out.data);
-		return GNUTLS_E_CERTIFICATE_ERROR;
-	}
-
-	return 0;
+	return br;
 }
 
 static void deinit_session(tls_int_st *ses)
@@ -219,10 +152,12 @@ static void deinit_session(tls_int_st *ses)
 	if (ses->init != 0) {
 		ses->init = 0;
 		pthread_mutex_destroy(&ses->lock);
-		if (ses->sockfd != -1)
+		if (ses->sockfd != -1) {
 			close(ses->sockfd);
-		if (ses->session)
-			gnutls_deinit(ses->session);
+		}
+		SSL_CTX_free((SSL_get_SSL_CTX(ses->ssl)));
+		SSL_free(ses->ssl);
+		EVP_cleanup();
 	}
 }
 
@@ -257,70 +192,7 @@ static int init_session(rc_handle *rh, tls_int_st *ses,
 		((struct sockaddr_in6 *)our_sockaddr)->sin6_port = 0;
 
 	ses->sockfd = sockfd;
-
-	/* Initialize DTLS */
-
-	flags = GNUTLS_CLIENT;
-	if (secflags&SEC_FLAG_DTLS)
-		flags |= GNUTLS_DATAGRAM;
-	ret = gnutls_init(&ses->session, flags);
-	if (ret < 0) {
-		rc_log(LOG_ERR,
-		       "%s: error in gnutls_init(): %s", __func__, gnutls_strerror(ret));
-		ret = -1;
-		goto cleanup;
-	}
-
 	memcpy(&ses->our_sockaddr, our_sockaddr, sizeof(*our_sockaddr));
-	if (!(secflags&SEC_FLAG_DTLS)) {
-		if (timeout > 0) {
-			gnutls_handshake_set_timeout(ses->session, timeout*1000);
-		} else {
-			gnutls_handshake_set_timeout(ses->session, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
-		}
-	} else { /* DTLS */
-		if (timeout > 0)
-			gnutls_dtls_set_timeouts(ses->session, 1000, timeout*1000);
-	}
-
-	gnutls_transport_set_int(ses->session, sockfd);
-	gnutls_session_set_ptr(ses->session, ses);
-	/* we only initiate heartbeat messages */
-	gnutls_heartbeat_enable(ses->session, GNUTLS_HB_LOCAL_ALLOWED_TO_SEND);
-
-	p = rc_conf_str(rh, "tls-verify-hostname");
-	if (p && (strcasecmp(p, "false") == 0 || strcasecmp(p, "no"))) {
-		ses->skip_hostname_check = 1;
-	}
-
-	if (st && st->psk_cred) {
-		cred_set = 1;
-		gnutls_credentials_set(ses->session,
-				       GNUTLS_CRD_PSK, st->psk_cred);
-
-		ret = gnutls_priority_set_direct(ses->session, "NORMAL:-KX-ALL:+ECDHE-PSK:+DHE-PSK:+PSK:-VERS-TLS1.0", NULL);
-		if (ret < 0) {
-			ret = -1;
-			rc_log(LOG_ERR,
-			       "%s: error in setting PSK priorities: %s",
-			       __func__, gnutls_strerror(ret));
-			goto cleanup;
-
-			cred_set = 1;
-		}
-	} else if (st) {
-		cred_set = 1;
-		if (st->x509_cred) {
-			gnutls_credentials_set(ses->session,
-					       GNUTLS_CRD_CERTIFICATE,
-					       st->x509_cred);
-		}
-
-		gnutls_set_default_priority(ses->session);
-	}
-
-	gnutls_server_name_set(ses->session, GNUTLS_NAME_DNS,
-			       hostname, strlen(hostname));
 
 	info =
 	    rc_getaddrinfo(hostname, PW_AI_AUTH);
@@ -348,15 +220,6 @@ static int init_session(rc_handle *rh, tls_int_st *ses,
 	strlcpy(ses->hostname, hostname, sizeof(ses->hostname));
 	ses->port = port;
 
-	if (cred_set == 0) {
-		rc_log(LOG_CRIT,
-		       "%s: neither tls-ca-file or a PSK key are configured",
-		       __func__);
-		ret = -1;
-		goto cleanup;
-	}
-
-	/* we connect since we are talking to a single server */
 	ret = connect(sockfd, info->ai_addr, info->ai_addrlen);
 	freeaddrinfo(info);
 	if (ret == -1) {
@@ -367,27 +230,29 @@ static int init_session(rc_handle *rh, tls_int_st *ses,
 		goto cleanup;
 	}
 
+	if (SSL_set_fd(ses->ssl, sockfd) !=1 ) {
+		rc_log(LOG_ERR, "%s:SSL_set_fd failed ", __func__);\
+		goto cleanup;
+	}
+
 	rc_log(LOG_DEBUG,
 	       "%s: performing TLS/DTLS handshake with [%s]:%d",
 	       __func__, hostname, port);
-	do {
-		ret = gnutls_handshake(ses->session);
-		if (ret == GNUTLS_E_LARGE_PACKET)
-			break;
-	} while (ret < 0 && gnutls_error_is_fatal(ret) == 0);
-
-	if (ret < 0) {
-		rc_log(LOG_ERR, "%s: error in handshake: %s",
-		       __func__, gnutls_strerror(ret));
+	if (ses->ssl) {
+		ERR_clear_error();
+		ret = SSL_connect(ses->ssl);
+	}
+	if (ret<1) {
+		rc_log(LOG_ERR, "%s: SSL error 0x%lx in connect", __func__, ERR_get_error());
 		ret = -1;
 		goto cleanup;
 	}
 
 	return 0;
+
  cleanup:
 	deinit_session(ses);
 	return ret;
-
 }
 
 /* The time after the last message was received, that
@@ -408,17 +273,18 @@ static void restart_session(rc_handle *rh, tls_st *st)
 
 	timeout = rc_conf_int(rh, "radius_timeout");
 
+	if (st->ctx.init != 0) {
+		st->ctx.init = 0;
+		pthread_mutex_destroy(&st->ctx.lock);
+		close(st->ctx.sockfd);
+	}
 	/* reinitialize this session */
-	ret = init_session(rh, &tmps, st->ctx.hostname, st->ctx.port, &st->ctx.our_sockaddr, timeout, st->flags);
+	ret = init_session(rh, &st->ctx , st->ctx.hostname, st->ctx.port, &st->ctx.our_sockaddr, timeout, st->flags);
 	if (ret < 0) {
 		rc_log(LOG_ERR, "%s: error in re-initializing DTLS", __func__);
 		return;
 	}
 
-	if (tmps.sockfd == st->ctx.sockfd)
-		st->ctx.sockfd = -1;
-	deinit_session(&st->ctx);
-	memcpy(&st->ctx, &tmps, sizeof(tmps));
 	st->ctx.need_restart = 0;
 
 	return;
@@ -478,34 +344,49 @@ int rc_check_tls(rc_handle * rh)
 		if (st->ctx.need_restart != 0) {
 			restart_session(rh, st);
 		} else if (now - st->ctx.last_msg > TIME_ALIVE) {
-			ret = gnutls_heartbeat_ping(st->ctx.session, 64, 4, GNUTLS_HEARTBEAT_WAIT);
-			if (ret < 0) {
-				restart_session(rh, st);
-			}
+			restart_session(rh, st);
 			st->ctx.last_msg = now;
 		}
 	}
 	return 0;
 }
 
-/** @} */
-
-/*- This function will deinitialize a previously initialed DTLS or TLS session.
+/* This function will deinitialize a previously initialed DTLS or TLS session.
  *
  * @param rh the configuration handle.
- -*/
+ */
 void rc_deinit_tls(rc_handle * rh)
 {
 	tls_st *st = rh->so.ptr;
 	if (st) {
 		if (st->ctx.init != 0)
 			deinit_session(&st->ctx);
-		if (st->x509_cred)
-			gnutls_certificate_free_credentials(st->x509_cred);
-		if (st->psk_cred)
-			gnutls_psk_free_client_credentials(st->psk_cred);
 	}
 	free(st);
+}
+
+static SSL_CTX *init_ssl(void)
+{
+	SSL_METHOD *method = NULL;
+	SSL_CTX *ctx = NULL;
+
+	method = TLSv1_2_client_method();
+
+	ctx = SSL_CTX_new(method);
+	if (!ctx) {
+		rc_log(LOG_ERR, "%s: failed to create SSL context", __func__);
+		return NULL;
+	}
+	return ctx;
+}
+
+static int set_trust_file(const char *ca_file, SSL_CTX *ctx)
+{
+	if (SSL_CTX_load_verify_locations(ctx, ca_file, NULL) !=1 ) {
+		return -1;
+	}
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+	return 0;
 }
 
 /*- Initialize a configuration for TLS or DTLS
@@ -520,11 +401,10 @@ int rc_init_tls(rc_handle * rh, unsigned flags)
 {
 	int ret;
 	tls_st *st = NULL;
+	SSL_CTX *ssl_ctx = NULL;
+	SSL *ssl = NULL;
 	struct sockaddr_storage our_sockaddr;
 	const char *ca_file = rc_conf_str(rh, "tls-ca-file");
-	const char *cert_file = rc_conf_str(rh, "tls-cert-file");
-	const char *key_file = rc_conf_str(rh, "tls-key-file");
-	const char *pskkey = NULL;
 	SERVER *authservers;
 	char hostname[256];	/* server's hostname */
 	unsigned port;		/* server's port */
@@ -540,6 +420,8 @@ int rc_init_tls(rc_handle * rh, unsigned flags)
 	}
 
 	rc_own_bind_addr(rh, &our_sockaddr);
+	
+	ssl_ctx = init_ssl();
 
 	st = calloc(1, sizeof(tls_st));
 	if (st == NULL) {
@@ -552,50 +434,23 @@ int rc_init_tls(rc_handle * rh, unsigned flags)
 
 	rh->so.ptr = st;
 
-	if (ca_file || (key_file && cert_file)) {
-		ret = gnutls_certificate_allocate_credentials(&st->x509_cred);
-		if (ret < 0) {
+	/* Currently only verify server by using a provided ca file or skip server 
+	 * verfication altogether.Also assume server does not require client 
+	 * verification. If client verification is required, add support for 
+	 * rc_conf_str(rh, "tls-cert-file") and rc_conf_str(rh, "tls-key-file")
+	 */
+	if (ca_file) {
+		if (set_trust_file(ca_file, ssl_ctx) < 0) {
+			rc_log(LOG_ERR, "%s: error in ca verify location", __func__);
 			ret = -1;
-			rc_log(LOG_ERR,
-			       "%s: error in setting X.509 credentials: %s",
-			       __func__, gnutls_strerror(ret));
 			goto cleanup;
 		}
-
-		if (ca_file) {
-			ret =
-			    gnutls_certificate_set_x509_trust_file(st->x509_cred,
-							   ca_file,
-							   GNUTLS_X509_FMT_PEM);
-			if (ret < 0) {
-				ret = -1;
-				rc_log(LOG_ERR,
-				       "%s: error in setting X.509 trust file: %s: %s",
-				       __func__, gnutls_strerror(ret), ca_file);
-				goto cleanup;
-			}
-		}
-
-		if (cert_file && key_file) {
-			ret =
-			    gnutls_certificate_set_x509_key_file(st->x509_cred,
-								 cert_file,
-								 key_file,
-								 GNUTLS_X509_FMT_PEM);
-			if (ret < 0) {
-				ret = -1;
-				rc_log(LOG_ERR,
-				       "%s: error in setting X.509 cert and key files: %s: %s - %s",
-				       __func__, gnutls_strerror(ret), cert_file, key_file);
-				goto cleanup;
-			}
-		}
-
-		gnutls_certificate_set_verify_function(st->x509_cred,
-						       cert_verify_callback);
+	} else { 
+		SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
 	}
 
-	/* Read the PSK key if any */
+	st->ctx.ssl = SSL_new(ssl_ctx);
+
 	authservers = rc_conf_srv(rh, "authserver");
 	if (authservers == NULL) {
 		rc_log(LOG_ERR,
@@ -612,67 +467,6 @@ int rc_init_tls(rc_handle * rh, unsigned flags)
 	}
 	strlcpy(hostname, authservers->name[0], sizeof(hostname));
 	port = authservers->port[0];
-	if (authservers->secret)
-		pskkey = authservers->secret[0];
-
-	if (pskkey && pskkey[0] != 0) {
-		char *p;
-		char username[64];
-		gnutls_datum_t hexkey;
-		int username_len;
-
-		if (strncmp(pskkey, "psk@", 4) != 0) {
-			ret = -1;
-			rc_log(LOG_ERR,
-			       "%s: server secret is set but does not start with 'psk@'",
-			       __func__);
-			goto cleanup;
-		}
-		pskkey+=4;
-
-		if ((p = strchr(pskkey, '@')) == NULL) {
-			ret = -1;
-			rc_log(LOG_ERR,
-			       "%s: PSK key is not in 'username@hexkey' format",
-			       __func__);
-			goto cleanup;
-		}
-
-		username_len = p - pskkey;
-		if (username_len + 1 > sizeof(username)) {
-			rc_log(LOG_ERR,
-			       "%s: PSK username too big", __func__);
-			ret = -1;
-			goto cleanup;
-		}
-
-		strlcpy(username, pskkey, username_len + 1);
-
-		p++;
-		hexkey.data = (uint8_t*)p;
-		hexkey.size = strlen(p);
-
-		ret = gnutls_psk_allocate_client_credentials(&st->psk_cred);
-		if (ret < 0) {
-			ret = -1;
-			rc_log(LOG_ERR,
-			       "%s: error in setting PSK credentials: %s",
-			       __func__, gnutls_strerror(ret));
-			goto cleanup;
-		}
-
-		ret =
-		    gnutls_psk_set_client_credentials(st->psk_cred,
-						      username, &hexkey,
-						      GNUTLS_PSK_KEY_HEX);
-		if (ret < 0) {
-			ret = -1;
-			rc_log(LOG_ERR,
-			       "%s: error in setting PSK key: %s",
-			       __func__, gnutls_strerror(ret));
-			goto cleanup;
-		}
-	}
 
 	ret = init_session(rh, &st->ctx, hostname, port, &our_sockaddr, 0, flags);
 	if (ret < 0) {
@@ -686,18 +480,13 @@ int rc_init_tls(rc_handle * rh, unsigned flags)
 	rh->so.lock = tls_lock;
 	rh->so.unlock = tls_unlock;
 	return 0;
- cleanup:
+ 
+cleanup:
 	if (st) {
 		if (st->ctx.init != 0)
 			deinit_session(&st->ctx);
-		if (st->x509_cred)
-			gnutls_certificate_free_credentials(st->x509_cred);
-		if (st->psk_cred)
-			gnutls_psk_free_client_credentials(st->psk_cred);
 	}
 	free(st);
 	return ret;
 }
-
-#endif
 

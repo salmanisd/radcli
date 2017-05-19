@@ -23,6 +23,7 @@
 #include <includes.h>
 #include <radcli/radcli.h>
 #include <options.h>
+#include <openssl/evp.h>
 #include "util.h"
 #include "tls.h"
 
@@ -534,12 +535,10 @@ static int apply_config(rc_handle *rh)
 		rh->so_type = RC_SOCKET_TCP;
 		memcpy(&rh->so, &default_tcp_socket_funcs, sizeof(rh->so));
 		ret = 0;
-#ifdef HAVE_GNUTLS
 	} else if (strcasecmp(txt, "dtls") == 0) {
 		ret = rc_init_tls(rh, SEC_FLAG_DTLS);
 	} else if (strcasecmp(txt, "tls") == 0) {
 		ret = rc_init_tls(rh, 0);
-#endif
 	} else {
 		rc_log(LOG_CRIT, "unknown server type: %s", txt);
 		return -1;
@@ -1090,7 +1089,22 @@ void rc_config_free(rc_handle *rh)
 
 static int _initialized = 0;
 
-/** Initialises new Radius Client handle
+static openssl_global_init(void) 
+{
+	SSL_load_error_strings();
+	SSL_library_init();
+	OpenSSL_add_all_algorithms();
+}
+
+static openssl_global_deinit(void)
+{
+    ENGINE_cleanup();
+    CONF_modules_unload();
+    ERR_free_strings();
+    EVP_cleanup();
+    CRYPTO_cleanup_all_ex_data();
+}
+/**i Initialises new Radius Client handle
  *
  * @return a new rc_handle (free with rc_destroy).
  */
@@ -1101,15 +1115,7 @@ rc_handle *rc_new(void)
 
 	if (_initialized == 0) {
 		srandom((unsigned int)(time(NULL)+getpid()));
-#if defined(HAVE_GNUTLS) && GNUTLS_VERSION_NUMBER < 0x030300
-		ret = gnutls_global_init();
-		if (ret < 0) {
-			rc_log(LOG_ERR,
-			       "%s: error initializing gnutls: %s",
-			       __func__, gnutls_strerror(ret));
-			return NULL;
-		}
-#endif
+		openssl_global_init();
 	}
 	_initialized++;
 
@@ -1131,12 +1137,10 @@ void rc_destroy(rc_handle *rh)
 	rc_config_free(rh);
 	free(rh);
 
-#if defined(HAVE_GNUTLS) && GNUTLS_VERSION_NUMBER < 0x030300
 	_initialized--;
 	if (_initialized == 0) {
-		gnutls_global_deinit();
+		openssl_global_deinit();
 	}
-#endif
 }
 
 /** Returns the type of the socket used

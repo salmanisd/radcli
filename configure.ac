@@ -157,14 +157,15 @@ AC_ARG_WITH([tls], [AS_HELP_STRING([--without-tls],
 
 default_nettle_val=yes
 if test "$with_tls" != no; then
-	PKG_CHECK_MODULES([LIBGNUTLS], [gnutls >= 3.1.0], [use_gnutls=yes], [use_gnutls=no])
+	AC_DEFINE([HAVE_GNUTLS], 1, [Define to 1 to use gnutls for TLS and DTLS.])
+	#PKG_CHECK_MODULES([LIBGNUTLS], [gnutls >= 3.1.0], [use_gnutls=yes], [use_gnutls=no])
 
-	if test "$use_gnutls" = yes;then
-		CRYPTO_CFLAGS="$CRYPTO_CFLAGS $LIBGNUTLS_CFLAGS"
-		CRYPTO_LIBS="$CRYPTO_LIBS $LIBGNUTLS_LIBS"
-		AC_DEFINE([HAVE_GNUTLS], 1, [Define to 1 to use gnutls for TLS and DTLS.])
-		REQUIRES_PRIVATE="${REQUIRES_PRIVATE} gnutls,"
-	fi
+	#if test "$use_gnutls" = yes;then
+	#	CRYPTO_CFLAGS="$CRYPTO_CFLAGS $LIBGNUTLS_CFLAGS"
+	#	CRYPTO_LIBS="$CRYPTO_LIBS $LIBGNUTLS_LIBS"
+	#	AC_DEFINE([HAVE_GNUTLS], 1, [Define to 1 to use gnutls for TLS and DTLS.])
+	#	REQUIRES_PRIVATE="${REQUIRES_PRIVATE} gnutls,"
+	#fi
 	default_nettle_val=yes
 fi
 

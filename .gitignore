@@ -32,27 +32,27 @@ tests/*.trs
 .deps
 
 # Configure and Automake
-configure
-config.status
-config.cache
-config.log
-config.h
-libtool
-stamp-h*
-Makefile
-Makefile.in
-autom4te.cache/
-compile
-test-driver
-config.rpath
-aclocal.m4
-config.h.in
-config.guess
-config.sub
-depcomp
-install-sh
-ltmain.sh
-missing
+#configure
+#config.status
+#config.cache
+#config.log
+#config.h
+#libtool
+#stamp-h*
+#Makefile
+#Makefile.in
+#autom4te.cache/
+#compile
+#test-driver
+#config.rpath
+#aclocal.m4
+#config.h.in
+#config.guess
+#config.sub
+#depcomp
+#install-sh
+#ltmain.sh
+#missing
 
 # Misc
 *.swp

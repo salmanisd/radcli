@@ -44,7 +44,7 @@ if HAVE_LD_VERSION_SCRIPT
 libradcli_la_LDFLAGS += -Wl,--version-script=$(srcdir)/radcli.map
 endif
 
-libradcli_la_LIBADD = $(LINK_LIBS)
+libradcli_la_LIBADD = $(LINK_LIBS) -lssl -lcrypto
 
 install-exec-hook:
 if ENABLE_LEGACY_COMPAT

@@ -13,17 +13,13 @@
  */
 
 #include <includes.h>
+#include <openssl/rand.h>
 #include <radcli/radcli.h>
 #include <pathnames.h>
 #include <poll.h>
 #include "util.h"
 #include "rc-md5.h"
 #include "rc-hmac.h"
-
-#if defined(HAVE_GNUTLS)
-# include <gnutls/gnutls.h>
-# include <gnutls/crypto.h>
-#endif
 
 #define SCLOSE(fd) if (sfuncs->close_fd) sfuncs->close_fd(fd)
 
@@ -343,11 +339,10 @@ static void rc_random_vector(unsigned char *vector)
 {
 	int randno;
 	int i;
-#if defined(HAVE_GNUTLS)
-	if (gnutls_rnd(GNUTLS_RND_NONCE, vector, AUTH_VECTOR_LEN) >= 0) {
+	if (RAND_bytes(vector, AUTH_VECTOR_LEN) != 1) {
 		return;
 	}
-#elif defined(HAVE_GETENTROPY)
+#if defined(HAVE_GETENTROPY)
 	if (getentropy(vector, AUTH_VECTOR_LEN) >= 0) {
 		return;
 	}			/* else fall through */
@@ -647,13 +642,17 @@ int rc_send_server_ctx(rc_handle * rh, RC_AAA_CTX ** ctx, SEND_DATA * data,
 
 	for (;;) {
 		do {
+			rc_log(LOG_ERR, "calling sento from sendserver");
 			result =
 			    sfuncs->sendto(sfuncs->ptr, sockfd, (char *)auth,
 					   (unsigned int)total_length, (int)0,
 					   SA(auth_addr->ai_addr),
 					   auth_addr->ai_addrlen);
+			rc_log(LOG_ERR, "sendto returned with result = %d", result);
+
 		} while (result == -1 && errno == EINTR);
 		if (result == -1) {
+			rc_log(LOG_ERR, "sendto failed in sendserver errno %d", errno);
 			rc_log(LOG_ERR, "%s: socket: %s", __FUNCTION__,
 			       strerror(errno));
 			result = ERROR_RC;
@@ -682,6 +681,7 @@ int rc_send_server_ctx(rc_handle * rh, RC_AAA_CTX ** ctx, SEND_DATA * data,
 
 		if (result == 1 && (pfd.revents & POLLIN) != 0) {
 			salen = auth_addr->ai_addrlen;
+			rc_log(LOG_ERR, "calling recvfrom from sendserver");
 			do {
 				length = sfuncs->recvfrom(sfuncs->ptr, sockfd,
 							  (char *)recv_buffer,
@@ -690,10 +690,12 @@ int rc_send_server_ctx(rc_handle * rh, RC_AAA_CTX ** ctx, SEND_DATA * data,
 							  (int)0,
 							  SA(auth_addr->
 							     ai_addr), &salen);
+			rc_log(LOG_ERR, "recvfrom returned with length = %d", length);
 			} while (length == -1 && errno == EINTR);
 
 			if (length <= 0) {
 				int e = errno;
+				rc_log(LOG_ERR, "recvfrom  length = 0 error" );
 				rc_log(LOG_ERR,
 				       "rc_send_server: recvfrom: %s:%d: %s",
 				       server_name, data->svc_port,
@@ -703,6 +705,7 @@ int rc_send_server_ctx(rc_handle * rh, RC_AAA_CTX ** ctx, SEND_DATA * data,
 				SCLOSE(sockfd);
 				memset(secret, '\0', sizeof(secret));
 				result = ERROR_RC;
+				rc_log(LOG_ERR, "recvfrom going to cleanup" );
 				goto cleanup;
 			}
 
