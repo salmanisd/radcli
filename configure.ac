@@ -155,21 +155,19 @@ AC_ARG_WITH([tls], [AS_HELP_STRING([--without-tls],
 	[with_tls=$withval],
 	[with_tls=yes])
 
-default_nettle_val=yes
+default_nettle_val=no
 if test "$with_tls" != no; then
 	AC_DEFINE([HAVE_GNUTLS], 1, [Define to 1 to use gnutls for TLS and DTLS.])
-	#PKG_CHECK_MODULES([LIBGNUTLS], [gnutls >= 3.1.0], [use_gnutls=yes], [use_gnutls=no])
+	PKG_CHECK_MODULES([OPENSSL], [openssl >= 0.9.8], [use_openssl=yes], [use_openssl=no])
 
-	#if test "$use_gnutls" = yes;then
-	#	CRYPTO_CFLAGS="$CRYPTO_CFLAGS $LIBGNUTLS_CFLAGS"
-	#	CRYPTO_LIBS="$CRYPTO_LIBS $LIBGNUTLS_LIBS"
-	#	AC_DEFINE([HAVE_GNUTLS], 1, [Define to 1 to use gnutls for TLS and DTLS.])
-	#	REQUIRES_PRIVATE="${REQUIRES_PRIVATE} gnutls,"
-	#fi
-	default_nettle_val=yes
+	if test "$use_openssl" = yes;then
+		CRYPTO_CFLAGS="$CRYPTO_CFLAGS $OPENSSL_CFLAGS"
+		CRYPTO_LIBS="$CRYPTO_LIBS $OPENSSL_LIBS"
+	fi
+	default_nettle_val=no
 fi
 
-AM_CONDITIONAL(ENABLE_GNUTLS, test "$use_gnutls" = "yes")
+AM_CONDITIONAL(ENABLE_GNUTLS, test "$use_openssl" = "yes")
 
 AC_ARG_WITH([nettle], [AS_HELP_STRING([--without-nettle],
 	[use nettle for crypto @<:@default=no@:>@])],
@@ -262,6 +260,6 @@ AC_MSG_NOTICE([Configuration:
 
   Additional libraries:      $LINK_LIBS
   Nettle for MD5:            $use_nettle
-  TLS and DTLS support:      $use_gnutls
+  TLS and DTLS support:      $use_openssl
   freeradius-client compat:  $enable_compat
 ])
